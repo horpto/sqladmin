@@ -842,6 +842,8 @@ class Admin(BaseAdminView):
 
         except ValidationError as exc:
             exc.enrich_form(form)
+            if form.form_errors:
+                context["error"] = " ".join(form.form_errors)
 
             return await self.templates.TemplateResponse(
                 request, model_view.create_template, context, status_code=400
@@ -926,6 +928,8 @@ class Admin(BaseAdminView):
                 )
         except ValidationError as exc:
             exc.enrich_form(form)
+            if form.form_errors:
+                context["error"] = " ".join(form.form_errors)
 
             return await self.templates.TemplateResponse(
                 request, model_view.edit_template, context, status_code=400
