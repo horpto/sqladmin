@@ -1,25 +1,18 @@
 from __future__ import annotations
 
+import builtins
 import inspect as inspect_module
 import json
+import logging
 import time
 import warnings
+from collections.abc import AsyncGenerator, Callable, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
-    AsyncGenerator,
-    Callable,
     ClassVar,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Type,
-    Union,
     no_type_check,
 )
 from typing import cast as typing_cast
@@ -33,6 +26,7 @@ from sqlalchemy.orm.collections import InstrumentedList, InstrumentedSet
 from sqlalchemy.orm.exc import DetachedInstanceError
 from sqlalchemy.sql.elements import ClauseElement
 from sqlalchemy.sql.expression import Select, select
+from starlette import status
 from starlette.datastructures import URL
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
@@ -44,6 +38,7 @@ from sqladmin._queries import Query
 from sqladmin._types import (
     _UNSET,
     BASE_FORMATTERS_TYPE,
+    COLUMN_FORMATTER_TYPE,
     MODEL_ATTR,
     SESSION_MAKER,
     ColumnFilter,
@@ -52,6 +47,13 @@ from sqladmin._types import (
     StrEnum,
 )
 from sqladmin.ajax import create_ajax_loader
+from sqladmin.audit import AuditEntry
+from sqladmin.authorization import (
+    Action,
+    AllowAllAuthorizationBackend,
+    AuthorizationBackend,
+    custom_action,
+)
 from sqladmin.exceptions import InvalidModelError
 from sqladmin.formatters import BASE_FORMATTERS
 from sqladmin.forms import (
@@ -88,6 +90,21 @@ __all__ = [
 ]
 
 
+_ALLOW_ALL = AllowAllAuthorizationBackend()
+
+# The ``can_*`` flag that turns each built-in action off (``list`` has none).
+_ACTION_FLAGS: dict[Action, str | None] = {
+    Action.LIST: None,
+    Action.DETAILS: "can_view_details",
+    Action.CREATE: "can_create",
+    Action.EDIT: "can_edit",
+    Action.DELETE: "can_delete",
+    Action.EXPORT: "can_export",
+    Action.IMPORT: "can_import",
+}
+_ACCESSIBLE_CACHE_ATTR = "sqladmin_accessible_views"
+
+
 class ModelViewMeta(type):
     """Metaclass used to specify class variables in ModelView.
 
@@ -97,7 +114,7 @@ class ModelViewMeta(type):
 
     @no_type_check
     def __new__(mcs, name, bases, attrs: dict, **kwargs: Any):
-        cls: Type["ModelView"] = super().__new__(mcs, name, bases, attrs)
+        cls: type[ModelView] = super().__new__(mcs, name, bases, attrs)
 
         model = kwargs.get("model")
 
@@ -133,12 +150,39 @@ class ModelViewMeta(type):
         return cls
 
     @classmethod
-    def _check_conflicting_options(mcs, keys: List[str], attrs: dict) -> None:
+    def _check_conflicting_options(mcs, keys: list[str], attrs: dict) -> None:
         if all(k in attrs for k in keys):
             raise AssertionError(f"Cannot use {' and '.join(keys)} together.")
 
 
 class BaseModelView:
+    identity: ClassVar[str] = ""
+
+    def _authorization_backend(self) -> AuthorizationBackend:
+        # A view not yet added to an Admin has no backend: allow everything.
+        admin = getattr(self, "_admin_ref", None)
+        return getattr(admin, "authorization_backend", _ALLOW_ALL)
+
+    def has_permission(
+        self, request: Request, action: str, obj: Any | None = None
+    ) -> bool:
+        """Ask the configured authorization backend about one action on this view.
+
+        Returns `True` when no
+        [`AuthorizationBackend`][sqladmin.authorization.AuthorizationBackend]
+        is configured, so this is safe to call from templates and custom views
+        regardless of setup.
+
+        ???+ usage
+            ```python
+            {% if model_view.has_permission(request, "delete") %}
+            ```
+        """
+
+        return self._authorization_backend().has_permission(
+            request, self.identity, action, obj
+        )
+
     def is_visible(self, request: Request) -> bool:
         """Override this method if you want dynamically
         hide or show administrative views from SQLAdmin menu structure
@@ -147,13 +191,37 @@ class BaseModelView:
         """
         return True
 
+    def _authorization_actions(self) -> Sequence[str]:
+        """Every action that could grant access to this view."""
+
+        # A custom page has nothing to list, so ``list`` means viewing it.
+        return (Action.LIST,)
+
     def is_accessible(self, request: Request) -> bool:
         """Override this method to add permission checks.
-        SQLAdmin does not make any assumptions about the authentication system
-        used in your application, so it is up to you to implement it.
-        By default, it will allow access for everyone.
+
+        Gates the menu entry and every route of this view. By default a
+        `ModelView` is accessible when the configured
+        [`AuthorizationBackend`][sqladmin.authorization.AuthorizationBackend]
+        allows at least one action on it -- a built-in action its ``can_*``
+        flags leave on, or one of the view's own `@action` endpoints. A custom
+        page (`BaseView`) is accessible when ``list`` is allowed on it.
+        Everyone gets in when no backend is configured. Override it to hide
+        the view on your own terms.
         """
-        return True
+
+        # The menu asks several times per page; the answer can't change
+        # within a request.
+        cache = getattr(request.state, _ACCESSIBLE_CACHE_ATTR, None)
+        if cache is None:
+            cache = {}
+            setattr(request.state, _ACCESSIBLE_CACHE_ATTR, cache)
+        if id(self) not in cache:
+            cache[id(self)] = any(
+                self.has_permission(request, action)
+                for action in self._authorization_actions()
+            )
+        return cache[id(self)]
 
 
 class BaseView(BaseModelView):
@@ -178,7 +246,7 @@ class BaseView(BaseModelView):
     # Internals
     is_model: ClassVar[bool] = False
     templates: ClassVar[Jinja2Templates]
-    _admin_ref: ClassVar["BaseAdmin"]
+    _admin_ref: ClassVar[BaseAdmin]
 
     name: ClassVar[str] = ""
     """Name of the view to be displayed."""
@@ -186,7 +254,7 @@ class BaseView(BaseModelView):
     identity: ClassVar[str] = ""
     """Same as name but it will be used for URL of the endpoints."""
 
-    methods: ClassVar[List[str]] = ["GET"]
+    methods: ClassVar[list[str]] = ["GET"]
     """List of method names for the endpoint.
     By default it's set to `["GET"]` only.
     """
@@ -225,7 +293,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     model: ClassVar[type]
 
     # Internals
-    pk_columns: ClassVar[Tuple[Column]]
+    pk_columns: ClassVar[tuple[Column]]
     session_maker: ClassVar[SESSION_MAKER]
     is_async: ClassVar[bool] = False
     is_model: ClassVar[bool] = True
@@ -273,7 +341,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     """
 
     # List page
-    column_list: ClassVar[Union[str, Sequence[MODEL_ATTR]]] = []
+    column_list: ClassVar[str | Sequence[MODEL_ATTR]] = []
     """List of columns to display in `List` page.
     Columns can either be string names or SQLAlchemy columns.
 
@@ -298,7 +366,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    column_formatters: ClassVar[Dict[MODEL_ATTR, Callable[..., Any]]] = {}
+    column_formatters: ClassVar[dict[MODEL_ATTR, COLUMN_FORMATTER_TYPE]] = {}
     """Dictionary of list view column formatters.
     Columns can either be string names or SQLAlchemy columns.
 
@@ -312,9 +380,9 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     ???+ formatter
         ```python
         def formatter(model, attribute, request):
-            # `model` is model instance
-            # `attribute` is a Union[ColumnProperty, RelationshipProperty]
-            # `request` is a starlette.requests.Request
+            # `model` is the model instance
+            # `attribute` is the name of the attribute being rendered
+            # `request` is a starlette.requests.Request, and is optional
             pass
         ```
     """
@@ -381,7 +449,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    column_default_sort: ClassVar[Union[MODEL_ATTR, Tuple[MODEL_ATTR, bool], list]] = []
+    column_default_sort: ClassVar[MODEL_ATTR | tuple[MODEL_ATTR, bool] | list] = []
     """Default sort column if no sorting is applied.
 
     ???+ example
@@ -409,7 +477,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     """
 
     # Details page
-    column_details_list: ClassVar[Union[str, Sequence[MODEL_ATTR]]] = []
+    column_details_list: ClassVar[str | Sequence[MODEL_ATTR]] = []
     """List of columns to display in `Detail` page.
     Columns can either be string names or SQLAlchemy columns.
 
@@ -434,7 +502,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    column_formatters_detail: ClassVar[Dict[MODEL_ATTR, Callable[..., Any]]] = {}
+    column_formatters_detail: ClassVar[dict[MODEL_ATTR, COLUMN_FORMATTER_TYPE]] = {}
     """Dictionary of details view column formatters.
     Columns can either be string names or SQLAlchemy columns.
 
@@ -448,9 +516,9 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     ???+ formatter
         ```python
         def formatter(model, attribute, request):
-            # `model` is model instance
-            # `attribute` is a Union[ColumnProperty, RelationshipProperty]
-            # `request` is a starlette.requests.Request
+            # `model` is the model instance
+            # `attribute` is the name of the attribute being rendered
+            # `request` is a starlette.requests.Request, and is optional
             pass
         ```
     """
@@ -497,7 +565,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     displayed in a separate line."""
 
     # Export
-    column_export_list: ClassVar[List[MODEL_ATTR]] = []
+    column_export_list: ClassVar[builtins.list[MODEL_ATTR]] = []
     """List of columns to include when exporting.
     Columns can either be string names or SQLAlchemy columns.
 
@@ -508,7 +576,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    column_export_exclude_list: ClassVar[List[MODEL_ATTR]] = []
+    column_export_exclude_list: ClassVar[builtins.list[MODEL_ATTR]] = []
     """List of columns to exclude when exporting.
     Columns can either be string names or SQLAlchemy columns.
 
@@ -519,7 +587,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    export_types: ClassVar[List[str]] = ["csv", "json"]
+    export_types: ClassVar[builtins.list[str]] = ["csv", "json"]
     """A list of available export filetypes.
     Currently only `csv` is supported.
     """
@@ -541,7 +609,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     """
 
     # Import
-    column_import_list: ClassVar[List[MODEL_ATTR]] = []
+    column_import_list: ClassVar[builtins.list[MODEL_ATTR]] = []
     """List of columns to include when importing.
     Columns can either be string names or SQLAlchemy columns.
 
@@ -552,7 +620,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    column_import_exclude_list: ClassVar[List[MODEL_ATTR]] = []
+    column_import_exclude_list: ClassVar[builtins.list[MODEL_ATTR]] = []
     """List of columns to exclude when importing.
     Columns can either be string names or SQLAlchemy columns.
 
@@ -564,7 +632,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     """
 
     # Form
-    form: ClassVar[Optional[Type[Form]]] = None
+    form: ClassVar[type[Form] | None] = None
     """Form class.
     Override if you want to use custom form for your model.
     Will completely disable form scaffolding functionality.
@@ -579,7 +647,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    form_base_class: ClassVar[Type[Form]] = Form
+    form_base_class: ClassVar[type[Form]] = Form
     """Base form class.
     Will be used by form scaffolding function when creating model form.
     Useful if you want to have custom constructor or override some fields.
@@ -595,7 +663,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    form_args: ClassVar[Dict[str, Dict[str, Any]]] = {}
+    form_args: ClassVar[dict[str, dict[str, Any]]] = {}
     """Dictionary of form field arguments.
     Refer to WTForms documentation for list of possible options.
 
@@ -610,7 +678,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    form_widget_args: ClassVar[Dict[str, Dict[str, Any]]] = {}
+    form_widget_args: ClassVar[dict[str, dict[str, Any]]] = {}
     """Dictionary of form widget rendering arguments.
     Use this to customize how widget is rendered without using custom template.
 
@@ -650,7 +718,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    form_overrides: ClassVar[Dict[str, Type[Field]]] = {}
+    form_overrides: ClassVar[dict[str, type[Field]]] = {}
     """Dictionary of form column overrides.
 
     ???+ example
@@ -670,7 +738,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    form_ajax_refs: ClassVar[Dict[str, dict]] = {}
+    form_ajax_refs: ClassVar[dict[str, dict]] = {}
     """Use Ajax for foreign key model loading.
     Should contain dictionary, where key is field name and
     value is a dictionary which configures Ajax lookups.
@@ -687,7 +755,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    form_converter: ClassVar[Type[ModelConverterBase]] = ModelConverter
+    form_converter: ClassVar[type[ModelConverterBase]] = ModelConverter
     """Custom form converter class.
     Useful if you want to add custom form conversion in addition to the defaults.
 
@@ -724,7 +792,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     """Customized rules for the edit form. Cannot be specified with `form_rules`."""
 
     # General options
-    column_labels: ClassVar[Dict[MODEL_ATTR, str]] = {}
+    column_labels: ClassVar[dict[MODEL_ATTR, str]] = {}
     """A mapping of column labels, used to map column names to new names.
     Dictionary keys can be string names or SQLAlchemy columns with string values.
 
@@ -771,7 +839,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         ```
     """
 
-    non_link_related_fields: ClassVar[List[MODEL_ATTR]] = []
+    non_link_related_fields: ClassVar[builtins.list[MODEL_ATTR]] = []
     """Relationship fields that should be rendered as plain text instead of links.
 
     Values can be relationship attributes or string field names.
@@ -857,9 +925,9 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
         self._refresh_form_rules_cache()
 
-        self._custom_actions_in_list: Dict[str, str] = {}
-        self._custom_actions_in_detail: Dict[str, str] = {}
-        self._custom_actions_confirmation: Dict[str, str] = {}
+        self._custom_actions_in_list: dict[str, str] = {}
+        self._custom_actions_in_detail: dict[str, str] = {}
+        self._custom_actions_confirmation: dict[str, str] = {}
 
         self._column_type_formatters = self.column_type_formatters.copy()
         if (
@@ -929,7 +997,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
     def _get_prop_name(self, prop: MODEL_ATTR) -> str:
         return prop if isinstance(prop, str) else prop.key
 
-    def _get_default_sort(self) -> List[Tuple[str, bool]]:
+    def _get_default_sort(self) -> builtins.list[tuple[str, bool]]:
         if self.column_default_sort:
             if isinstance(self.column_default_sort, list):
                 return self.column_default_sort
@@ -1003,8 +1071,8 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         return positional_count >= 3
 
     def _build_formatter_request_support(
-        self, formatters: Dict[str, Callable[..., Any]]
-    ) -> Dict[str, bool]:
+        self, formatters: dict[str, Callable[..., Any]]
+    ) -> dict[str, bool]:
         return {
             prop: self._formatter_accepts_request(formatter)
             for prop, formatter in formatters.items()
@@ -1023,7 +1091,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
         return formatter(obj, prop)
 
-    def validate_page_number(self, number: Union[str, None], default: int) -> int:
+    def validate_page_number(self, number: str | None, default: int) -> int:
         if not number:
             return default
 
@@ -1031,10 +1099,11 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
             return int(number)
         except ValueError as exc:
             raise HTTPException(
-                status_code=400, detail="Invalid page or pageSize parameter"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid page or pageSize parameter",
             ) from exc
 
-    async def count(self, request: Request, stmt: Optional[Select] = None) -> int:
+    async def count(self, request: Request, stmt: Select | None = None) -> int:
         if stmt is None:
             stmt = self.count_query(request)
         rows = await self._run_query(stmt)
@@ -1042,8 +1111,15 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
     async def list(self, request: Request) -> Pagination:
         page = self.validate_page_number(request.query_params.get("page"), 1)
-        page_size = self.validate_page_number(request.query_params.get("pageSize"), 0)
-        page_size = min(page_size or self.page_size, max(self.page_size_options))
+        page_size = self.validate_page_number(
+            request.query_params.get("pageSize"), self.page_size
+        )
+        page_size = min(page_size, max(self.page_size_options))
+        if page_size < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid page or pageSize parameter",
+            )
         search = request.query_params.get("search", None)
 
         stmt = self.list_query(request)
@@ -1082,21 +1158,23 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
             request, select(func.count()).select_from(stmt.subquery())
         )
 
+        # Clamp before the offset is built: an out-of-range page would otherwise
+        # reach the driver as a huge or negative OFFSET.
+        page = min(max(page, 1), Pagination.max_page(count, page_size))
+
         stmt = stmt.limit(page_size).offset((page - 1) * page_size)
         rows = await self._run_query(stmt)
 
-        pagination = Pagination(
+        return Pagination(
             rows=rows,
             page=page,
             page_size=page_size,
             count=count,
         )
 
-        return pagination
-
     async def get_model_objects(
-        self, request: Request, limit: Union[int, None] = 0
-    ) -> List[Any]:
+        self, request: Request, limit: int | None = 0
+    ) -> builtins.list[Any]:
         # For unlimited rows this should pass None
         limit = None if limit == 0 else limit
         stmt = self.list_query(request).limit(limit)
@@ -1165,7 +1243,9 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         obj = await self._get_object_by_pk(stmt)
 
         if column_name not in self._mapper.columns:
-            raise HTTPException(status_code=404, detail="Unknown column.")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Unknown column."
+            )
 
         column_value = getattr(obj, column_name)
         from sqladmin.helpers import (
@@ -1177,9 +1257,12 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
         path = resolve_storage_path(column_value)
         if path is None:
-            raise HTTPException(status_code=404)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
         if is_http_url(path):
-            raise HTTPException(status_code=400, detail="Remote URLs are not served.")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Remote URLs are not served.",
+            )
 
         allowed_roots = get_column_storage_roots(self._mapper.columns[column_name])
         try:
@@ -1187,10 +1270,14 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         except ValueError as exc:
             message = str(exc)
             if message == "File not found":
-                raise HTTPException(status_code=404) from exc
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from exc
             if message == "File path not allowed":
-                raise HTTPException(status_code=403, detail=message) from exc
-            raise HTTPException(status_code=400, detail=message) from exc
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail=message
+                ) from exc
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=message
+            ) from exc
 
     def _stmt_by_identifier(self, identifier: str) -> Select:
         stmt = select(self.model)
@@ -1224,7 +1311,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
     async def get_list_value(
         self, obj: Any, prop: str, request: Request | None = None
-    ) -> Tuple[Any, Any]:
+    ) -> tuple[Any, Any]:
         """Get tuple of (value, formatted_value) for the list view."""
 
         value = await self.get_prop_value(obj, prop)
@@ -1244,7 +1331,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
     async def get_detail_value(
         self, obj: Any, prop: str, request: Request | None = None
-    ) -> Tuple[Any, Any]:
+    ) -> tuple[Any, Any]:
         """Get tuple of (value, formatted_value) for the detail view."""
 
         value = await self.get_prop_value(obj, prop)
@@ -1264,10 +1351,10 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
     def _build_column_list(
         self,
-        defaults: List[str],
-        include: Optional[Union[str, Sequence[MODEL_ATTR]]] = None,
-        exclude: Optional[Union[str, Sequence[MODEL_ATTR]]] = None,
-    ) -> List[str]:
+        defaults: builtins.list[str],
+        include: str | Sequence[MODEL_ATTR] | None = None,
+        exclude: str | Sequence[MODEL_ATTR] | None = None,
+    ) -> builtins.list[str]:
         """This function generalizes constructing a list of columns
         for any sequence of inclusions or exclusions.
         """
@@ -1283,7 +1370,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
         return defaults
 
-    def get_list_columns(self) -> List[str]:
+    def get_list_columns(self) -> builtins.list[str]:
         """Get list of properties to display in List page."""
 
         column_list = getattr(self, "column_list", None)
@@ -1295,7 +1382,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
             defaults=[pk.name for pk in self.pk_columns],
         )
 
-    def get_details_columns(self) -> List[str]:
+    def get_details_columns(self) -> builtins.list[str]:
         """Get list of properties to display in Detail page."""
 
         column_details_list = getattr(self, "column_details_list", None)
@@ -1307,7 +1394,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
             defaults=self._prop_names,
         )
 
-    def get_form_columns(self) -> List[str]:
+    def get_form_columns(self) -> builtins.list[str]:
         """Get list of properties to display in the form."""
 
         form_columns = getattr(self, "form_columns", None)
@@ -1319,7 +1406,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
             defaults=self._prop_names,
         )
 
-    def get_export_columns(self) -> List[str]:
+    def get_export_columns(self) -> builtins.list[str]:
         """Get list of properties to export."""
 
         columns = getattr(self, "column_export_list", None)
@@ -1331,7 +1418,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
             defaults=self._list_prop_names,
         )
 
-    def get_filters(self) -> List[ColumnFilter]:
+    def get_filters(self) -> builtins.list[ColumnFilter]:
         """Get list of filters."""
 
         filters = getattr(self, "column_filters", None)
@@ -1340,7 +1427,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
         return filters
 
-    def get_import_columns(self) -> List[str]:
+    def get_import_columns(self) -> builtins.list[str]:
         """Get list of properties to import."""
 
         columns = getattr(self, "column_import_list", None)
@@ -1371,10 +1458,31 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         * ``Response`` -- return a custom Starlette ``Response`` directly.
         """
 
+    async def list_context(self, request: Request) -> dict[str, Any]:
+        """Extra template context for the list page.
+
+        Return a mapping that is merged into the base context for the list
+        template. Returns ``{}`` by default. Core keys (``model_view``,
+        ``pagination``, ...) always take precedence, so this can only add keys.
+        """
+        return {}
+
+    async def create_context(self, request: Request) -> dict[str, Any]:
+        """Extra template context for the create page. See :meth:`list_context`."""
+        return {}
+
+    async def edit_context(self, request: Request) -> dict[str, Any]:
+        """Extra template context for the edit page. See :meth:`list_context`."""
+        return {}
+
+    async def details_context(self, request: Request) -> dict[str, Any]:
+        """Extra template context for the details page. See :meth:`list_context`."""
+        return {}
+
     def _build_column_pairs(
         self,
-        pair: Dict[Any, Any],
-    ) -> Dict[str, Any]:
+        pair: dict[Any, Any],
+    ) -> dict[str, Any]:
         pairs = {}
         for label, value in pair.items():
             pairs[self._get_prop_name(label)] = value
@@ -1382,12 +1490,43 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
     async def delete_model(self, request: Request, pk: Any) -> None:
         await Query(self).delete(pk, request)
+        await self._emit_audit(request, "delete", pk, None)
+
+    async def _emit_audit(
+        self,
+        request: Request,
+        action: str,
+        pk: Any,
+        changes: dict | None,
+    ) -> None:
+        """Send an :class:`~sqladmin.audit.AuditEntry` to the configured
+        audit backend. Best-effort: a failing backend is logged, not raised,
+        so a broken audit config cannot break an already-committed change."""
+        backend = getattr(getattr(self, "_admin_ref", None), "audit_backend", None)
+        if backend is None:
+            return
+        entry = AuditEntry(
+            action=action,
+            identity=self.identity,
+            pk=str(pk) if pk is not None else None,
+            changes=changes,
+        )
+        try:
+            await backend.log(entry, request)
+        except Exception:  # pragma: no cover - defensive
+            logging.getLogger("sqladmin.audit").exception(
+                "Audit backend failed to log %s on %s", action, self.identity
+            )
 
     async def insert_model(self, request: Request, data: dict) -> Any:
-        return await Query(self).insert(data, request)
+        obj = await Query(self).insert(data, request)
+        await self._emit_audit(request, "create", get_object_identifier(obj), data)
+        return obj
 
     async def update_model(self, request: Request, pk: str, data: dict) -> Any:
-        return await Query(self).update(pk, data, request)
+        obj = await Query(self).update(pk, data, request)
+        await self._emit_audit(request, "update", pk, data)
+        return obj
 
     async def on_model_delete(self, model: Any, request: Request) -> None:
         """Perform some actions before a model is deleted.
@@ -1399,36 +1538,106 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         By default do nothing.
         """
 
+    def _authorization_actions(self) -> Sequence[str]:
+        # A grant for an action the view has switched off opens nothing.
+        return (
+            *(
+                action
+                for action, flag in _ACTION_FLAGS.items()
+                if flag is None or getattr(self, flag)
+            ),
+            *(
+                custom_action(slug)
+                for slug in {
+                    **self._custom_actions_in_list,
+                    **self._custom_actions_in_detail,
+                }
+            ),
+        )
+
+    def _can_delete_any(self, request: Request) -> bool:
+        # The bulk-delete menu and modal are not tied to one row, so they
+        # cannot use ``check_can_delete``; the delete route still checks every
+        # selected row with it.
+        return self.can_delete and self.has_permission(request, Action.DELETE)
+
+    def _visible_custom_actions(
+        self, request: Request, in_detail: bool = False
+    ) -> dict[str, str]:
+        """Custom actions the current user is allowed to invoke.
+
+        Each `@action` is checked against the authorization backend under
+        ``action:<slug>``, so unauthorized buttons are not rendered at all --
+        the endpoint itself rejects them either way.
+        """
+
+        actions = (
+            self._custom_actions_in_detail
+            if in_detail
+            else self._custom_actions_in_list
+        )
+        return {
+            slug: label
+            for slug, label in actions.items()
+            if self.has_permission(request, custom_action(slug))
+        }
+
+    async def check_can_list(self, request: Request) -> bool:
+        """
+        You can add a custom checker before listing.
+        """
+        return self.has_permission(request, Action.LIST)
+
+    async def check_can_create(self, request: Request) -> bool:
+        """
+        You can add a custom checker before creation.
+        The class variable `can_create` has higher priority than the result of
+        the `check_can_create` method. In other words, if `check_can_create`
+        returns `True` but `can_create` is set to `False`,
+        creation will still be forbidden.
+        """
+        return self.can_create and self.has_permission(request, Action.CREATE)
+
     async def check_can_view_details(self, request: Request, model: Any) -> bool:
         """
         You can add a custom model attribute checker before view details.
         """
-        return self.can_view_details
+        return self.can_view_details and self.has_permission(
+            request, Action.DETAILS, model
+        )
 
     async def check_can_edit(self, request: Request, model: Any) -> bool:
         """
         You can add a custom model attribute checker before edit.
         """
-        return self.can_edit
+        return self.can_edit and self.has_permission(request, Action.EDIT, model)
 
     async def check_can_delete(self, request: Request, model: Any) -> bool:
         """
         You can add a custom model attribute checker before delete.
         """
-        return self.can_delete
+        return self.can_delete and self.has_permission(request, Action.DELETE, model)
+
+    async def check_can_export(self, request: Request) -> bool:
+        """
+        You can add a custom checker before export.
+        """
+        return self.can_export and self.has_permission(request, Action.EXPORT)
 
     async def check_can_import(self, request: Request) -> bool:
         """
         You can add a custom model attribute checker before import.
         """
-        return self.can_import
+        return self.can_import and self.has_permission(request, Action.IMPORT)
 
     async def on_import_row(self, data: dict, model: Any, request: Request) -> None:
         """Perform some actions on a validated import row before it is persisted.
         By default does nothing.
         """
 
-    async def scaffold_form(self, rules: List[str] | None = None) -> Type[Form]:
+    async def scaffold_form(
+        self, rules: builtins.list[str] | None = None
+    ) -> type[Form]:
         if self.form is not None:
             return self.form
 
@@ -1473,8 +1682,8 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         self,
         stmt: Select,
         field_path: str,
-        joined_paths: Set[str],
-    ) -> Tuple[Select, Any]:
+        joined_paths: set[str],
+    ) -> tuple[Select, Any]:
         """Join relationship paths and return the statement and target model.
 
         Navigates through a dotted relationship path (e.g. ``user.profile.role``)
@@ -1512,7 +1721,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         """
 
         expressions = []
-        joined_paths: Set[str] = set()
+        joined_paths: set[str] = set()
 
         for field in self._search_fields:
             stmt, model = self._join_relationship_paths(stmt, field, joined_paths)
@@ -1592,12 +1801,15 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
         if sort_by:
             if sort_by not in self._sort_fields:
-                raise HTTPException(status_code=400, detail="Invalid sortBy parameter")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid sortBy parameter",
+                )
             sort_fields = [(sort_by, sort == "desc")]
         else:
             sort_fields = self._get_default_sort()
 
-        joined_paths: Set[str] = set()
+        joined_paths: set[str] = set()
 
         for sort_field, is_desc in sort_fields:
             field_path = self._get_prop_name(sort_field)
@@ -1618,7 +1830,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
     async def export_data(
         self,
-        data: List[Any],
+        data: builtins.list[Any],
         export_type: str = "csv",
         request: Request | None = None,
     ) -> StreamingResponse:
@@ -1637,7 +1849,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
     async def _export_csv(
         self,
-        data: List[Any],
+        data: builtins.list[Any],
     ) -> StreamingResponse:
         async def generate(writer: Writer) -> AsyncGenerator[Any, None]:
             # Append the column titles at the beginning
@@ -1662,7 +1874,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
 
     async def _export_json(
         self,
-        data: List[Any],
+        data: builtins.list[Any],
         ensure_ascii: bool = False,
     ) -> StreamingResponse:
         async def generate() -> AsyncGenerator[str, None]:
@@ -1696,7 +1908,7 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
         row: Any,
         name: str,
         value: Any,
-    ) -> Optional[str]:
+    ) -> str | None:
         """
         Override to provide custom formatting for a specific cell in pretty export.
 
@@ -1715,7 +1927,9 @@ class ModelView(BaseView, metaclass=ModelViewMeta):
             self._form_create_rules = self.form_create_rules
             self._form_edit_rules = self.form_edit_rules
 
-    def _validate_form_class(self, ruleset: List[Any], form_class: Type[Form]) -> None:
+    def _validate_form_class(
+        self, ruleset: builtins.list[Any], form_class: type[Form]
+    ) -> None:
         form_fields = []
         for name, obj in form_class.__dict__.items():
             if isinstance(obj, UnboundField):

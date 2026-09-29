@@ -1,10 +1,11 @@
-from typing import Generator
+from collections.abc import Generator
 
 import pytest
 from sqlalchemy import Column, Integer, String
 from sqlalchemy.orm import declarative_base, sessionmaker
 from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
+from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -14,6 +15,7 @@ from starlette.testclient import TestClient
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sqladmin import Admin, ModelView
+from sqladmin.i18n import DEFAULT_LOCALE, gettext, set_locale
 from tests.common import sync_engine as engine
 
 Base = declarative_base()  # type: ignore
@@ -228,6 +230,63 @@ def test_get_save_redirect_url():
     assert response.text == "http://testserver/admin/user/edit/1"
 
 
+def _translated(locale: str, label: str) -> str:
+    """Render ``label`` in ``locale`` the way the templates would."""
+
+    set_locale(locale)
+    try:
+        return gettext(label)
+    finally:
+        set_locale(DEFAULT_LOCALE)
+
+
+def test_get_save_redirect_url_localized():
+    """The submit button labels are rendered via gettext (create/edit
+    templates), so in non-English locales the submitted ``save`` value is the
+    translated label. The redirect must be resolved the same way."""
+
+    async def index(request: Request):
+        obj = User(id=1)
+        form_data = await request.form()
+        # LocaleMiddleware would have resolved the locale before the handler.
+        set_locale("ru")
+        try:
+            url = admin.get_save_redirect_url(request, form_data, admin.views[0], obj)
+        finally:
+            set_locale(DEFAULT_LOCALE)
+        return Response(str(url))
+
+    app = Starlette(
+        routes=[
+            Route("/{identity}", index, methods=["POST"]),
+        ]
+    )
+    admin = Admin(app=app, engine=engine)
+
+    class UserAdmin(ModelView, model=User):
+        save_as = True
+
+    admin.add_view(UserAdmin)
+
+    client = TestClient(app)
+
+    response = client.post("/user", data={"save": _translated("ru", "Save")})
+    assert response.text == "http://testserver/admin/user/list"
+
+    response = client.post(
+        "/user", data={"save": _translated("ru", "Save and continue editing")}
+    )
+    assert response.text == "http://testserver/admin/user/edit/1"
+
+    response = client.post("/user", data={"save": _translated("ru", "Save as new")})
+    assert response.text == "http://testserver/admin/user/edit/1"
+
+    response = client.post(
+        "/user", data={"save": _translated("ru", "Save and add another")}
+    )
+    assert response.text == "http://testserver/admin/user/create"
+
+
 def test_build_category_menu():
     app = Starlette()
     admin = Admin(app=app, engine=engine)
@@ -269,7 +328,11 @@ def test_denormalize_wtform_fields() -> None:
     }
 
 
-def test_validate_page_and_page_size():
+@pytest.mark.parametrize(
+    "query",
+    ["page=aaaa", "pageSize=aaaa", "pageSize=0", "pageSize=-5"],
+)
+def test_reject_invalid_page_and_page_size(query: str) -> None:
     app = Starlette()
     admin = Admin(app=app, engine=engine)
 
@@ -279,11 +342,40 @@ def test_validate_page_and_page_size():
 
     client = TestClient(app)
 
-    response = client.get("/admin/user/list?page=10000")
-    assert response.status_code == 200
-
-    response = client.get("/admin/user/list?page=aaaa")
+    response = client.get(f"/admin/user/list?{query}")
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("page", "expected_page"),
+    [
+        ("-1", 1),
+        ("0", 1),
+        ("99999999999999999999", 3),
+        # count is an exact multiple of page_size: the case main got wrong.
+        ("4", 3),
+    ],
+)
+def test_redirect_out_of_range_page_before_query(page: str, expected_page: int) -> None:
+    app = Starlette()
+    admin = Admin(app=app, engine=engine)
+
+    class UserAdmin(ModelView, model=User): ...
+
+    admin.add_view(UserAdmin)
+
+    with session_maker() as session:
+        session.add_all(User() for _ in range(UserAdmin.page_size * 3))
+        session.commit()
+
+    client = TestClient(app)
+
+    response = client.get(f"/admin/user/list?page={page}", follow_redirects=False)
+
+    assert response.status_code == 302
+    assert response.headers["location"] == (
+        f"http://testserver/admin/user/list?page={expected_page}"
+    )
 
 
 def test_polymorphic_model_pages_use_view_identity() -> None:
@@ -360,3 +452,47 @@ def test_is_list_template_global():
     assert is_list(123) is False
     assert is_list(None) is False
     assert is_list({"key": "value"}) is False
+
+
+def test_application_http_exception_handler_raise_type_error():
+    app = Starlette()
+    admin = Admin(app=app, engine=engine)
+
+    # The built-in handler asserts it was given an HTTPException. Route a
+    # different exception type at it to reach that guard.
+    admin.admin.exception_handlers = {
+        ValueError: admin.admin.exception_handlers[HTTPException]
+    }
+
+    class UserAdmin(ModelView, model=User):
+        async def check_can_create(self, request: Request) -> bool:
+            raise ValueError("Error!")
+
+    admin.add_view(UserAdmin)
+
+    client = TestClient(app)
+
+    with pytest.raises(
+        TypeError, match="Expected HTTPException, got <class 'ValueError'>"
+    ):
+        client.get("/admin/user/create")
+
+
+def test_authentication_backend_is_none():
+    app = Starlette()
+    admin = Admin(app=app, engine=engine)
+
+    class UserAdmin(ModelView, model=User): ...
+
+    admin.add_view(UserAdmin)
+
+    client = TestClient(app)
+
+    response = client.get("/admin/login")
+    assert response.status_code == 503
+
+    response = client.post("/admin/login")
+    assert response.status_code == 503
+
+    response = client.get("/admin/logout")
+    assert response.status_code == 503

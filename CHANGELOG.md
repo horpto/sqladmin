@@ -6,6 +6,100 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Version [0.32.0](https://github.com/smithyhq/sqladmin/releases/tag/0.32.0): 2026-09-21
+
+### Added
+
+* Added Role Based Access Control (RBAC) by @mmzeynalli in [#1139](https://github.com/smithyhq/sqladmin/pull/1139)
+* Added debug_toolbar documentation for sqladmin by @haykeminyan in [#1125](https://github.com/smithyhq/sqladmin/pull/1125)
+* feat(i18n): add Japanese translations by @savvan0h in [#1141](https://github.com/smithyhq/sqladmin/pull/1141)
+
+### Changed
+
+* Increase coverage by @maxim-f1 in [#1113](https://github.com/smithyhq/sqladmin/pull/1113)
+* build(deps): bump starlette from 1.0.0 to 1.3.1 by @dependabot[bot] in [#1140](https://github.com/smithyhq/sqladmin/pull/1140)
+* build(deps): bump python-multipart from 0.0.28 to 0.0.32 by @dependabot[bot] in [#1134](https://github.com/smithyhq/sqladmin/pull/1134)
+* build(deps-dev): bump mypy from 2.3.0 to 2.3.1 by @dependabot[bot] in [#1131](https://github.com/smithyhq/sqladmin/pull/1131)
+* build(deps-dev): bump greenlet from 3.4.0 to 3.5.5 by @dependabot[bot] in [#1132](https://github.com/smithyhq/sqladmin/pull/1132)
+* build(deps-dev): bump sqlmodel from 0.0.39 to 0.0.42 by @dependabot[bot] in [#1135](https://github.com/smithyhq/sqladmin/pull/1135)
+* build(deps-dev): bump coverage from 7.13.5 to 7.16.0 by @dependabot[bot] in [#1133](https://github.com/smithyhq/sqladmin/pull/1133)
+
+### Fixed
+
+* fix: stop DateTime(timezone=True) values shifting on edit (#796) by @mmzeynalli in [#1142](https://github.com/smithyhq/sqladmin/pull/1142)
+* fix(pretty_export): stringify related objects when joining list values by @Sanjays2402 in [#1112](https://github.com/smithyhq/sqladmin/pull/1112)
+* fix(import): report invalid relationship values during CSV import by @Sanjays2402 in [#1120](https://github.com/smithyhq/sqladmin/pull/1120)
+* fix: validate pagination bounds before constructing LIMIT/OFFSET by @Vansh-Sharma27 in [#1137](https://github.com/smithyhq/sqladmin/pull/1137)
+* fix: handle translated save button labels in create/edit redirects by @x23n5902y in [#1126](https://github.com/smithyhq/sqladmin/pull/1126)
+
+### New Contributors
+
+* @Sanjays2402 made their first contribution in [#1112](https://github.com/smithyhq/sqladmin/pull/1112)
+* @savvan0h made their first contribution in [#1141](https://github.com/smithyhq/sqladmin/pull/1141)
+* @x23n5902y made their first contribution in [#1126](https://github.com/smithyhq/sqladmin/pull/1126)
+
+**Full Changelog**: [0.31.1...0.32.0](https://github.com/smithyhq/sqladmin/compare/0.31.1...0.32.0)
+
+## Version [0.31.1](https://github.com/smithyhq/sqladmin/releases/tag/0.31.1): 2026-09-01
+
+### Security
+
+* Fix advisory `GHSA-h6cj-3759-22v4`: enforce the per-view `is_accessible()` authorization hook on `@action` and `@expose` endpoints, which were wrapped in `login_required` only, allowing an authenticated but unauthorized user to invoke custom actions and exposed views. Rejected requests now return HTTP 403 by @aminalaee.
+
+**Full Changelog**: [0.31.0...0.31.1](https://github.com/smithyhq/sqladmin/compare/0.31.0...0.31.1)
+
+## Version [0.31.0](https://github.com/smithyhq/sqladmin/releases/tag/0.31.0): 2026-08-06
+
+### Added
+
+* [Feature] add `where` option in `form_ajax_refs` by @maxim-f1 in [#1101](https://github.com/smithyhq/sqladmin/pull/1101)
+* feat: add per-page template context hooks (#942) by @mmzeynalli in [#1104](https://github.com/smithyhq/sqladmin/pull/1104)
+* feat: add JSONEditorField for editing JSON columns (#1025) by @mmzeynalli in [#1105](https://github.com/smithyhq/sqladmin/pull/1105)
+* feat: add pluggable audit logging backends (#710) by @mmzeynalli in [#1106](https://github.com/smithyhq/sqladmin/pull/1106)
+* feat: add new type for `column_(detail_)formatters` by @mmzeynalli in [#1108](https://github.com/smithyhq/sqladmin/pull/1108)
+
+### Changed
+
+* docs: update README by @aminalaee in [#1110](https://github.com/smithyhq/sqladmin/pull/1110)
+* build(deps-dev): update uv-build requirement from <0.12.0,>=0.9.17 to >=0.9.17,<0.13.0 by @dependabot[bot] in [#1115](https://github.com/smithyhq/sqladmin/pull/1115)
+* build(deps-dev): bump types-wtforms from 3.2.1.20260408 to 3.2.1.20260518 by @dependabot[bot] in [#1117](https://github.com/smithyhq/sqladmin/pull/1117)
+* build(deps-dev): bump mypy from 2.1.0 to 2.3.0 by @dependabot[bot] in [#1118](https://github.com/smithyhq/sqladmin/pull/1118)
+* build(deps-dev): bump phonenumbers from 9.0.34 to 9.0.35 by @dependabot[bot] in [#1119](https://github.com/smithyhq/sqladmin/pull/1119)
+* build(deps-dev): bump sqlmodel from 0.0.38 to 0.0.39 by @dependabot[bot] in [#1116](https://github.com/smithyhq/sqladmin/pull/1116)
+
+### Fixed
+
+* fix: mark custom `BaseView` menu items active on their own page (#956) by @mmzeynalli in [#1103](https://github.com/smithyhq/sqladmin/pull/1103)
+* fix: make hidden textareas non-required by @mmzeynalli in [#1107](https://github.com/smithyhq/sqladmin/pull/1107)
+* fix: collapse category menu correctly by @mmzeynalli in [#1109](https://github.com/smithyhq/sqladmin/pull/1109)
+
+**Full Changelog**: [0.30.0...0.31.0](https://github.com/smithyhq/sqladmin/compare/0.30.0...0.31.0)
+
+## Version [0.30.0](https://github.com/smithyhq/sqladmin/releases/tag/0.30.0): 2026-07-28
+
+### Added
+
+* feat: add `check_can_create` permission hook by @maxim-f1 in [#1102](https://github.com/smithyhq/sqladmin/pull/1102)
+* feat: add internationalization and localization support by @vahidzhe in [#1095](https://github.com/smithyhq/sqladmin/pull/1095)
+
+### Changed
+
+* chore: apply ruff pyupgrade (UP) fixes across the codebase by @vahidzhe in [#1093](https://github.com/smithyhq/sqladmin/pull/1093)
+
+### Fixed
+
+* fix: unwrap Enum values in `get_object_identifier` by @pctablet505 in [#1092](https://github.com/smithyhq/sqladmin/pull/1092)
+* fix: display flash toast when the `bootstrap` global is undefined by @ebencollins in [#1100](https://github.com/smithyhq/sqladmin/pull/1100)
+* fix: support keyword arguments when rendering `TemplateResponse` by @haykeminyan in [#1094](https://github.com/smithyhq/sqladmin/pull/1094)
+
+### New Contributors
+
+* @ebencollins made their first contribution in [#1100](https://github.com/smithyhq/sqladmin/pull/1100)
+* @haykeminyan made their first contribution in [#1094](https://github.com/smithyhq/sqladmin/pull/1094)
+* @pctablet505 made their first contribution in [#1092](https://github.com/smithyhq/sqladmin/pull/1092)
+
+**Full Changelog**: [0.29.0...0.30.0](https://github.com/smithyhq/sqladmin/compare/0.29.0...0.30.0)
+
 ## Version [0.29.0](https://github.com/smithyhq/sqladmin/releases/tag/0.29.0): 2026-07-13
 
 ### DEPRECATIONS

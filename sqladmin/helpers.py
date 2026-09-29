@@ -8,14 +8,11 @@ import os
 import re
 import unicodedata
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator, Callable, Generator, Sequence
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import (
     Any,
-    AsyncGenerator,
-    Callable,
-    Generator,
-    Sequence,
     TypeVar,
     get_args,
     get_origin,
@@ -294,10 +291,24 @@ def get_primary_keys(model: Any) -> tuple[Column, ...]:
     return tuple(sa_inspect(model).mapper.primary_key)
 
 
+def _coerce_pk_value(value: Any) -> Any:
+    """Unwrap an Enum primary key to its underlying value.
+
+    SQLAlchemy returns the Enum member itself (e.g. ``Color.RED``) for a
+    column typed as an Enum, not its underlying value (e.g. ``"red"``).
+    Object identifiers are embedded in admin URLs, so the raw member's
+    ``str()`` (``"Color.RED"``) would produce a broken, non-round-trippable
+    path. Non-Enum values pass through unchanged.
+    """
+    if isinstance(value, enum.Enum):
+        return value.value
+    return value
+
+
 def get_object_identifier(obj: Any) -> Any:
     """Returns a value that uniquely identifies this object."""
     primary_keys = get_primary_keys(obj)
-    values = [getattr(obj, pk.name) for pk in primary_keys]
+    values = [_coerce_pk_value(getattr(obj, pk.name)) for pk in primary_keys]
 
     # Unaltered value for tables with a single primary key
     if len(values) == 1:
@@ -379,7 +390,15 @@ def build_import_form_row(
     form_row = MultiDict()
     for column_name in import_columns:
         if column_name in merged:
-            form_row[column_name] = serialize_import_value_for_form(merged[column_name])
+            value = merged[column_name]
+            if isinstance(value, (list, tuple)):
+                # A multi-select field reads one form value per selected item,
+                # so re-emit each item separately: str()-ing the list would
+                # hand the next validation pass the literal string "['1']".
+                for item in value:
+                    form_row.append(column_name, serialize_import_value_for_form(item))
+            else:
+                form_row[column_name] = serialize_import_value_for_form(value)
         else:
             form_row[column_name] = row.get(column_name) or ""
     return form_row
@@ -434,7 +453,7 @@ def object_identifier_values(id_string: str, model: Any) -> tuple:
 
 def get_direction(prop: MODEL_PROPERTY) -> str:
     if not isinstance(prop, RelationshipProperty):
-        raise TypeError("Expected RelationshipProperty, got %s" % type(prop))
+        raise TypeError(f"Expected RelationshipProperty, got {type(prop)}")
 
     name = prop.direction.name
     if name == "ONETOMANY" and not prop.uselist:

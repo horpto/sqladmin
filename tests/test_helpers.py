@@ -1,3 +1,4 @@
+import enum
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated, Any
@@ -9,6 +10,7 @@ from sqlalchemy import (
     Column,
     Date,
     DateTime,
+    Enum,
     ForeignKey,
     Integer,
     String,
@@ -95,6 +97,16 @@ class Flagged(Base):
     active = Column(Boolean, nullable=False)
 
 
+class AnimalEnum(str, enum.Enum):
+    DOG = "dog"
+    CAT = "cat"
+
+
+class Animal(Base):
+    __tablename__ = "animal"
+    id = Column(Enum(AnimalEnum), primary_key=True)
+
+
 def test_coerce_column_value() -> None:
     assert coerce_column_value(Profile.id, "3217") == 3217
     assert coerce_column_value(Family.id, "test") == "test"
@@ -163,6 +175,37 @@ def test_build_import_form_row_uses_coerced_values() -> None:
 
     assert form_row["active"] == "false"
     assert form_row["profile_id"] == "5"
+
+
+def test_build_import_form_row_repeats_multi_select_values() -> None:
+    """A multi-select reads one form value per selection.
+
+    ``str()``-ing the list instead would hand the next validation pass the
+    literal ``"['1', '2']"``, which matches no choice.
+    """
+
+    from starlette.datastructures import MultiDict
+
+    form_row = build_import_form_row(MultiDict(), {"tags": ["1", "2"]}, ["tags"])
+
+    assert form_row.getlist("tags") == ["1", "2"]
+
+
+def test_build_import_form_row_omits_empty_multi_select() -> None:
+    """An empty selection must leave the column out of the form data entirely.
+
+    WTForms only calls ``process_formdata`` for a key that is present, so an
+    absent column leaves the field at its default. Emitting ``""`` instead
+    would be read as an unknown selection and rejected with "Not a valid
+    choice", which is how an empty relationship cell in a CSV used to fail.
+    """
+
+    from starlette.datastructures import MultiDict
+
+    form_row = build_import_form_row(MultiDict(), {"tags": []}, ["tags"])
+
+    assert "tags" not in form_row
+    assert form_row.getlist("tags") == []
 
 
 def test_merge_import_row_data_invalid_foreign_key_type() -> None:
@@ -234,6 +277,16 @@ def test_single_pk_identifier():
 
     assert get_object_identifier(Profile(id=0)) == 0
     assert get_object_identifier(Profile(id=3217)) == 3217
+
+
+def test_single_pk_identifier_with_enum():
+    identifier = get_object_identifier(Animal(id=AnimalEnum.DOG))
+    assert identifier == "dog"
+    # `AnimalEnum` subclasses `str`, so an unwrapped enum member already
+    # equals and isinstance-checks as "dog" even without the fix in
+    # `get_object_identifier` -- assert the exact type to actually catch
+    # a regression back to returning the raw enum member.
+    assert type(identifier) is str
 
 
 def test_single_pk_id_values():
