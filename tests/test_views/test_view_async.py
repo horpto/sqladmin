@@ -325,6 +325,10 @@ class AsyncValidationAdmin(ModelView, model=AsyncValidation):
     ) -> None:
         if data.get("name") == "invalid":
             raise ValidationError(name="This name is forbidden")
+        if data.get("name") == "formlevel":
+            raise ValidationError("Cross-field check failed")
+        if data.get("name") == "anything":
+            raise ValidationError()
 
 
 admin.add_view(UserAdmin)
@@ -2202,8 +2206,8 @@ async def test_hybrid_property_sql_expression() -> None:
     assert value == "Daniel inplace"
 
 
-async def test_async_validation_error(client: AsyncClient):
-    # Test creation with invalid data
+async def test_validation_error(client: AsyncClient):
+    # Test creation with invalid data (field error)
     response = await client.post(
         "/admin/async-validation/create",
         data={"name": "invalid"},
@@ -2220,3 +2224,70 @@ async def test_async_validation_error(client: AsyncClient):
 
     # Redirect after success
     assert response.status_code == 302, response.content
+
+    # Test edit with field error
+    async with session_maker() as session:
+        obj = AsyncValidation(id=9999, name="original")
+        session.add(obj)
+        await session.commit()
+
+    response = await client.post(
+        "/admin/async-validation/edit/9999",
+        data={"name": "invalid"},
+    )
+
+    assert response.status_code == 400, response.content
+    assert b"This name is forbidden" in response.content
+
+    # Test edit with valid data
+    response = await client.post(
+        "/admin/async-validation/edit/9999",
+        data={"name": "updated"},
+    )
+
+    assert response.status_code == 302, response.content
+
+
+async def test_validation_error_form_level(client: AsyncClient) -> None:
+    """Test that form-level validation errors are displayed on the page."""
+    # Create a record to edit
+    async with session_maker() as session:
+        obj = AsyncValidation(id=9998, name="test")
+        session.add(obj)
+        await session.commit()
+
+    # Test create with form-level error
+    response = await client.post(
+        "/admin/async-validation/create",
+        data={"name": "formlevel"},
+    )
+
+    assert response.status_code == 400, response.content
+    assert b"Cross-field check failed" in response.content
+
+    # Test edit with form-level error
+    response = await client.post(
+        "/admin/async-validation/edit/9998",
+        data={"name": "formlevel"},
+    )
+
+    assert response.status_code == 400, response.content
+    assert b"Cross-field check failed" in response.content
+
+    # Test create with bare form-level error
+    response = await client.post(
+        "/admin/async-validation/create",
+        data={"name": "anything"},
+    )
+
+    assert response.status_code == 400, response.content
+    assert b"Validation error" in response.content
+
+    # Test create with bare form-level error
+    response = await client.post(
+        "/admin/async-validation/edit/9998",
+        data={"name": "anything"},
+    )
+
+    assert response.status_code == 400, response.content
+    assert b"Validation error" in response.content
